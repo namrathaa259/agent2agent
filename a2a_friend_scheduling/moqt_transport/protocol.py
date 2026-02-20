@@ -558,14 +558,24 @@ def namespace_prefix_match(prefix: tuple[str, ...], namespace: tuple[str, ...]) 
 # ---------------------------------------------------------------------------
 
 def request_track(agent_id: str, session_ctx: str = "") -> tuple[list[str], str]:
-    """Track the HOST publishes requests on -> agent reads."""
-    ns = [session_ctx, "a2a"] if session_ctx else ["a2a"]
+    """Track the HOST publishes requests on -> agent reads.
+
+    Uses a separate namespace ["a2a", "request"] so the relay can
+    distinguish request publishers (host) from response/discovery
+    publishers (agents), avoiding namespace-collision mis-routing.
+    """
+    ns = [session_ctx, "a2a", "request"] if session_ctx else ["a2a", "request"]
     return (ns, f"agent-{agent_id}/request")
 
 
 def response_track(agent_id: str, session_ctx: str = "") -> tuple[list[str], str]:
-    """Track the AGENT publishes responses on -> host reads."""
-    ns = [session_ctx, "a2a"] if session_ctx else ["a2a"]
+    """Track the AGENT publishes responses on -> host reads.
+
+    Uses ["a2a", "agents"] so it does NOT prefix-match the host's
+    ["a2a", "request"] namespace, preventing the relay from confusing
+    agent and host publisher roles.
+    """
+    ns = [session_ctx, "a2a", "agents"] if session_ctx else ["a2a", "agents"]
     return (ns, f"agent-{agent_id}/response")
 
 

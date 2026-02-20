@@ -503,10 +503,18 @@ class MOQTRelaySession(QuicConnectionProtocol):
         self.transmit()
         logger.info("Relay %s: ANNOUNCE %s registered", self._session_id, ann.namespace)
 
-        # Check if there are pending downstream subscriptions for tracks in this namespace
+        # Create upstream subs for any downstream tracks in this namespace
+        # that don't yet have a valid upstream publisher.
         for ftn, ds_list in list(self._state.downstream_subs.items()):
             ns, track = ftn
-            if namespace_prefix_match(ns_tuple, ns) and ftn not in self._state.upstream_subs:
+            if not namespace_prefix_match(ns_tuple, ns):
+                continue
+            existing = self._state.upstream_subs.get(ftn)
+            if existing is None:
+                self._create_upstream_subscription(ftn, self._session_id)
+            elif not existing.established:
+                # Replace stale / unestablished upstream with the new publisher
+                del self._state.upstream_subs[ftn]
                 self._create_upstream_subscription(ftn, self._session_id)
 
     def _handle_unannounce(self, payload: bytes) -> None:
@@ -564,30 +572,37 @@ class MOQTRelaySession(QuicConnectionProtocol):
             return
 
         # Need to create an upstream subscription
-        if ftn not in self._state.upstream_subs:
+        existing = self._state.upstream_subs.get(ftn)
+        if existing and existing.publisher_session_id != self._session_id:
+            # Good upstream sub already exists (to a DIFFERENT session) — queue for ack
+            relay_sub_id = existing.relay_subscribe_id
+            if existing.established:
+                self._ctrl_send(stream_id, SubscribeOk(subscribe_id=sub.subscribe_id).encode())
+                self.transmit()
+            else:
+                if relay_sub_id not in self._state.pending_sub_oks:
+                    self._state.pending_sub_oks[relay_sub_id] = []
+                self._state.pending_sub_oks[relay_sub_id].append(
+                    (self._session_id, sub.subscribe_id)
+                )
+        else:
+            # No upstream sub, or existing one points back to the subscriber
+            # itself (circular). Find a DIFFERENT publisher.
             publishers = self._state.find_publishers_for_track(sub.namespace, sub.track_name)
+            publishers = [p for p in publishers if p != self._session_id]
             if publishers:
                 pub_session_id = publishers[0]
                 relay_sub_id = self._create_upstream_subscription(ftn, pub_session_id)
-                # Track pending downstream ack
                 if relay_sub_id not in self._state.pending_sub_oks:
                     self._state.pending_sub_oks[relay_sub_id] = []
                 self._state.pending_sub_oks[relay_sub_id].append(
                     (self._session_id, sub.subscribe_id)
                 )
             else:
-                # No publisher yet; reply OK optimistically (cached content may arrive later)
+                # No publisher yet; reply OK optimistically (content may arrive later
+                # when a publisher ANNOUNCEs and the relay creates the upstream sub).
                 self._ctrl_send(stream_id, SubscribeOk(subscribe_id=sub.subscribe_id).encode())
                 self.transmit()
-        else:
-            # Upstream sub exists but not yet established -- queue for ack
-            upstream = self._state.upstream_subs[ftn]
-            relay_sub_id = upstream.relay_subscribe_id
-            if relay_sub_id not in self._state.pending_sub_oks:
-                self._state.pending_sub_oks[relay_sub_id] = []
-            self._state.pending_sub_oks[relay_sub_id].append(
-                (self._session_id, sub.subscribe_id)
-            )
 
     def _create_upstream_subscription(self, ftn: FullTrackName, pub_session_id: str) -> int:
         """Send SUBSCRIBE to a publisher session on behalf of a downstream subscriber."""
@@ -830,9 +845,9 @@ class MOQTRelaySession(QuicConnectionProtocol):
                 return
 
             announced.sort(key=len, reverse=True)
-            ns_tuple = announced[0]
             synthetic_track = f"_proactive_{self._session_id}"
-            self._state.cache.put(obj, ns_tuple, synthetic_track)
+            for ns in announced:
+                self._state.cache.put(obj, ns, synthetic_track)
 
             forwarded_to: set[str] = set()
 
@@ -880,7 +895,7 @@ class MOQTRelaySession(QuicConnectionProtocol):
                 self._state.dispatcher._pending.set()
             logger.debug(
                 "Relay %s: proactive object cached under %s, forwarded to %d sessions",
-                self._session_id, list(ns_tuple), len(forwarded_to),
+                self._session_id, [list(ns) for ns in announced], len(forwarded_to),
             )
 
     def _resolve_object_track(self, obj: ObjectStream) -> Optional[FullTrackName]:
@@ -964,6 +979,7 @@ class MOQTRelay:
         config = QuicConfiguration(
             alpn_protocols=[MOQT_ALPN],
             is_client=False,
+            idle_timeout=300.0,
         )
         config.load_cert_chain(self._cert_file, self._key_file)
 

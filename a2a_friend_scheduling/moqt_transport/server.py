@@ -155,8 +155,10 @@ class MOQTAgentSession(QuicConnectionProtocol):
             # SERVER_SETUP
             self._ctrl_send(stream_id, ServerSetup(selected_version=ver).encode())
             self._setup_done = True
-            # Announce A2A namespaces we publish on
-            self._ctrl_send(stream_id, Announce(namespace=["a2a"]).encode())
+            # Announce agent-published namespaces (responses + discovery).
+            # ["a2a", "agents"] is intentionally disjoint from the host's
+            # ["a2a", "request"] to prevent relay publisher confusion.
+            self._ctrl_send(stream_id, Announce(namespace=["a2a", "agents"]).encode())
             self._ctrl_send(stream_id, Announce(namespace=["a2a", "discovery"]).encode())
             self.transmit()
             logger.info("MOQT server: setup complete — namespaces announced")
@@ -493,7 +495,7 @@ class MOQTRelayAgentProtocol(QuicConnectionProtocol):
         """ANNOUNCE namespaces, publish AgentCard, and subscribe to request track."""
         await self.wait_setup()
 
-        self._quic.send_stream_data(0, Announce(namespace=["a2a"]).encode())
+        self._quic.send_stream_data(0, Announce(namespace=["a2a", "agents"]).encode())
         self._quic.send_stream_data(0, Announce(namespace=["a2a", "discovery"]).encode())
         self.transmit()
 
@@ -596,6 +598,7 @@ class MOQTAgentServer:
         config = QuicConfiguration(
             alpn_protocols=[MOQT_ALPN],
             is_client=False,
+            idle_timeout=300.0,
         )
         config.load_cert_chain(self._cert_file, self._key_file)
 
@@ -629,6 +632,7 @@ class MOQTAgentServer:
         config = QuicConfiguration(
             alpn_protocols=[MOQT_ALPN],
             is_client=True,
+            idle_timeout=300.0,
         )
         if ca_cert:
             config.cafile = ca_cert
