@@ -2,21 +2,23 @@
 MOQT Agent Client
 Replaces A2AClient (httpx) + A2ACardResolver used by the Host Agent.
 
-Flow for get_agent_card()
-─────────────────────────
-  1. QUIC connect → MOQT CLIENT_SETUP / SERVER_SETUP
-  2. SUBSCRIBE to discovery track  ["a2a","discovery"] / "agent-{id}"
-  3. Server immediately publishes AgentCard as OBJECT_STREAM
-  4. Parse and return AgentCard
+Supports two modes:
+  1. Direct mode (original): connect directly to an agent's MOQT server.
+  2. Relay mode (new): connect to a MoQ Lite Relay, use SUBSCRIBE_NAMESPACE
+     for discovery, and route all messages through the relay.
 
-Flow for send_message()
-──────────────────────
-  1. (reuse existing connection)
-  2. SUBSCRIBE to response track  ["a2a"] / "agent-{id}/response"
-  3. ANNOUNCE ["a2a"] so server knows we will publish
-  4. PUBLISH request JSON-RPC on request track  ["a2a"] / "agent-{id}/request"
-  5. Wait for OBJECT_STREAM on response track
-  6. Parse and return SendMessageResponse
+Flow for relay mode discovery:
+  1. QUIC connect to relay -> CLIENT_SETUP / SERVER_SETUP
+  2. SUBSCRIBE_NAMESPACE ["a2a", "discovery"]
+  3. Relay delivers cached/live AgentCard OBJECT_STREAMs
+  4. Parse and return AgentCards
+
+Flow for relay mode send_message():
+  1. (reuse relay connection)
+  2. SUBSCRIBE to response track ["a2a"] / "agent-{id}/response"
+  3. ANNOUNCE ["a2a"] so relay knows we publish
+  4. PUBLISH request on ["a2a"] / "agent-{id}/request"
+  5. Relay forwards to the right agent, returns response
 """
 
 import asyncio
@@ -42,11 +44,15 @@ from .protocol import (
     Announce,
     AnnounceOk,
     ClientSetup,
+    MaxSubscribeId,
     ObjectStream,
     ServerSetup,
     Subscribe,
+    SubscribeDone,
     SubscribeNamespace,
+    SubscribeNamespaceOk,
     SubscribeOk,
+    Unsubscribe,
     decode_varint,
     frame_message,
     parse_control_message,
@@ -79,14 +85,25 @@ class MOQTClientProtocol(QuicConnectionProtocol):
         self._setup_event: asyncio.Event = asyncio.Event()
         self._ctrl_buf: bytes = b""
 
-        # subscribe_id → asyncio.Event (set when SUBSCRIBE_OK received)
+        # subscribe_id -> asyncio.Event (set when SUBSCRIBE_OK received)
         self._sub_acks: dict[int, asyncio.Event] = {}
+        # namespace_prefix tuple -> asyncio.Event (set when SUBSCRIBE_NAMESPACE_OK received)
+        self._ns_sub_acks: dict[tuple[str, ...], asyncio.Event] = {}
 
         # Incoming OBJECT_STREAMs from the server
         self._incoming: asyncio.Queue[ObjectStream] = asyncio.Queue()
 
+        # Per unidirectional-stream reassembly buffers (same fragmentation fix as relay).
+        self._data_bufs: dict[int, bytes] = {}
+
         self._next_sub_id: int = 0
         self._next_alias: int = 0
+
+        # Incoming SUBSCRIBEs from relay/server:
+        #   subscribe_id -> (namespace_tuple, track_name, track_alias)
+        self._incoming_subs: dict[int, tuple[tuple[str, ...], str, int]] = {}
+        # Signalled when a new incoming SUBSCRIBE is stored.
+        self._incoming_sub_event: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------------
     # aioquic event dispatch
@@ -104,7 +121,10 @@ class MOQTClientProtocol(QuicConnectionProtocol):
             if sid % 4 == 0:
                 self._on_control_data(sid, event.data)
             elif sid % 4 == 3:
-                self._on_server_data(event.data)
+                self._data_bufs[sid] = self._data_bufs.get(sid, b"") + event.data
+                if event.end_stream:
+                    buf = self._data_bufs.pop(sid)
+                    self._on_server_data(buf)
 
     # ------------------------------------------------------------------
     # Control stream
@@ -131,7 +151,7 @@ class MOQTClientProtocol(QuicConnectionProtocol):
     def _handle_control(
         self, stream_id: int, msg_type: MsgType, payload: bytes
     ) -> None:
-        logger.debug("MOQT client ← %s", msg_type.name)
+        logger.debug("MOQT client <- %s", msg_type.name)
 
         if msg_type == MsgType.SERVER_SETUP:
             ss = ServerSetup.decode(payload)
@@ -145,21 +165,48 @@ class MOQTClientProtocol(QuicConnectionProtocol):
                 event.set()
             logger.debug("MOQT client: SUBSCRIBE_OK sub_id=%d", sok.subscribe_id)
 
+        elif msg_type == MsgType.SUBSCRIBE_DONE:
+            sd = SubscribeDone.decode(payload)
+            logger.info("MOQT client: SUBSCRIBE_DONE sub_id=%d status=%d", sd.subscribe_id, sd.status_code)
+
         elif msg_type == MsgType.ANNOUNCE:
             ann = Announce.decode(payload)
-            # Acknowledge server announcements
             ack = AnnounceOk(namespace=ann.namespace)
             self._quic.send_stream_data(stream_id, ack.encode())
             self.transmit()
             logger.debug("MOQT client: ANNOUNCE_OK sent for %s", ann.namespace)
 
+        elif msg_type == MsgType.SUBSCRIBE:
+            sub = Subscribe.decode(payload)
+            self._incoming_subs[sub.subscribe_id] = (
+                tuple(sub.namespace), sub.track_name, sub.track_alias,
+            )
+            self._quic.send_stream_data(
+                stream_id, SubscribeOk(subscribe_id=sub.subscribe_id).encode(),
+            )
+            self.transmit()
+            self._incoming_sub_event.set()
+            logger.debug(
+                "MOQT client: accepted relay SUBSCRIBE sub_id=%d for %s/%s",
+                sub.subscribe_id, sub.namespace, sub.track_name,
+            )
+
         elif msg_type == MsgType.SUBSCRIBE_NAMESPACE:
-            # Server is subscribing to our namespace — acknowledge
             sns = SubscribeNamespace.decode(payload)
-            from .protocol import SubscribeNamespaceOk
             ok = SubscribeNamespaceOk(namespace_prefix=sns.namespace_prefix)
             self._quic.send_stream_data(stream_id, ok.encode())
             self.transmit()
+
+        elif msg_type == MsgType.SUBSCRIBE_NAMESPACE_OK:
+            snok = SubscribeNamespaceOk.decode(payload)
+            event = self._ns_sub_acks.get(tuple(snok.namespace_prefix))
+            if event:
+                event.set()
+            logger.debug("MOQT client: SUBSCRIBE_NAMESPACE_OK %s", snok.namespace_prefix)
+
+        elif msg_type == MsgType.MAX_SUBSCRIBE_ID:
+            msi = MaxSubscribeId.decode(payload)
+            logger.debug("MOQT client: MAX_SUBSCRIBE_ID=%d", msi.max_subscribe_id)
 
     # ------------------------------------------------------------------
     # Incoming data stream (server → client OBJECT_STREAMs)
@@ -216,6 +263,36 @@ class MOQTClientProtocol(QuicConnectionProtocol):
         )
         return sub_id, alias
 
+    async def subscribe_namespace(
+        self,
+        namespace_prefix: list[str],
+        timeout: float = 10.0,
+    ) -> None:
+        """
+        Send SUBSCRIBE_NAMESPACE and wait for SUBSCRIBE_NAMESPACE_OK.
+        Used for relay-mediated discovery (draft Section 4.1).
+        """
+        await self.wait_setup()
+        key = tuple(namespace_prefix)
+        ack_event = asyncio.Event()
+        self._ns_sub_acks[key] = ack_event
+
+        sns = SubscribeNamespace(namespace_prefix=namespace_prefix)
+        self._quic.send_stream_data(0, sns.encode())
+        self.transmit()
+
+        await asyncio.wait_for(ack_event.wait(), timeout)
+        logger.info("MOQT client: subscribed to namespace %s", namespace_prefix)
+
+    async def unsubscribe(self, subscribe_id: int) -> None:
+        """Send UNSUBSCRIBE to cancel a subscription."""
+        await self.wait_setup()
+        unsub = Unsubscribe(subscribe_id=subscribe_id)
+        self._quic.send_stream_data(0, unsub.encode())
+        self.transmit()
+        self._sub_acks.pop(subscribe_id, None)
+        logger.info("MOQT client: UNSUBSCRIBE sub_id=%d", subscribe_id)
+
     async def announce(self, namespace: list[str]) -> None:
         """Send ANNOUNCE so the server knows we will publish on this namespace."""
         await self.wait_setup()
@@ -223,6 +300,35 @@ class MOQTClientProtocol(QuicConnectionProtocol):
         self._quic.send_stream_data(0, ann.encode())
         self.transmit()
         logger.debug("MOQT client: ANNOUNCE %s", namespace)
+
+    async def wait_for_incoming_subscribe(
+        self,
+        namespace: list[str],
+        track_name: str,
+        timeout: float = 5.0,
+    ) -> tuple[int, int]:
+        """
+        Wait until the relay sends us a SUBSCRIBE for the given track.
+        Returns (subscribe_id, track_alias) from the relay's SUBSCRIBE.
+        """
+        ns_tuple = tuple(namespace)
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            for sub_id, (ns, tn, alias) in self._incoming_subs.items():
+                if ns == ns_tuple and tn == track_name:
+                    return sub_id, alias
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Relay did not SUBSCRIBE to {namespace}/{track_name} within {timeout}s"
+                )
+            self._incoming_sub_event.clear()
+            try:
+                await asyncio.wait_for(self._incoming_sub_event.wait(), remaining)
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"Relay did not SUBSCRIBE to {namespace}/{track_name} within {timeout}s"
+                )
 
     async def publish_object(
         self,
@@ -323,7 +429,7 @@ class MOQTAgentClient:
     async def get_agent_card(self, timeout: float = 10.0):
         """
         Fetch the remote agent's AgentCard via MOQT discovery track.
-        Replaces A2ACardResolver.get_agent_card().
+        Works in both direct and relay mode.
         """
         from a2a.types import AgentCard
 
@@ -334,38 +440,92 @@ class MOQTAgentClient:
         logger.info("MOQT client: got AgentCard for %s", self._agent_id)
         return AgentCard.model_validate(card_data)
 
+    async def discover_agents(self, timeout: float = 10.0, max_agents: int = 10):
+        """
+        Discover all agents via SUBSCRIBE_NAMESPACE on the relay (draft Section 4.1).
+        Returns a list of AgentCards received within the timeout window.
+        """
+        from a2a.types import AgentCard
+
+        await self._protocol.subscribe_namespace(["a2a", "discovery"], timeout=timeout)
+
+        cards = []
+        deadline = asyncio.get_event_loop().time() + timeout
+        while len(cards) < max_agents:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                obj = await self._protocol.receive_object(timeout=min(remaining, 2.0))
+                card_data = json.loads(obj.object_payload)
+                card = AgentCard.model_validate(card_data)
+                cards.append(card)
+                logger.info("MOQT client: discovered agent '%s'", card.name)
+            except asyncio.TimeoutError:
+                break
+            except Exception as exc:
+                logger.warning("MOQT client: error parsing discovery object: %s", exc)
+                break
+
+        logger.info("MOQT client: discovered %d agents via relay", len(cards))
+        return cards
+
     async def send_message(self, request, timeout: float = 30.0):
         """
         Send an A2A SendMessageRequest via MOQT and return SendMessageResponse.
-        Replaces A2AClient.send_message().
+        The JSON-RPC payload is identical to the HTTP transport (draft Section 3.3).
 
-        The JSON-RPC payload is identical to the HTTP transport (draft §3.3).
+        Flow (relay mode):
+          1. SUBSCRIBE to the agent's response track.
+          2. ANNOUNCE ["a2a"] — the relay then sends us SUBSCRIBE for the
+             agent's request track (because the agent has a downstream sub
+             for it).
+          3. Wait for that incoming SUBSCRIBE so we know the relay's
+             subscribe_id for the request track.
+          4. PUBLISH the request object using that subscribe_id, enabling
+             the relay to route it to the correct agent only.
+          5. Await the response OBJECT_STREAM.
         """
         from a2a.types import SendMessageResponse
 
-        # 1. Subscribe to response track so we can receive the reply
-        resp_ns, resp_track = response_track(self._agent_id)
-        resp_sub_id, resp_alias = await self._protocol.subscribe(
-            resp_ns, resp_track, timeout=10.0
+        req_ns, req_track_name = request_track(self._agent_id)
+        resp_ns, resp_track_name = response_track(self._agent_id)
+
+        # 1. Subscribe to response track
+        await self._protocol.subscribe(resp_ns, resp_track_name, timeout=10.0)
+
+        # 2. Announce request namespace so relay sends us SUBSCRIBE for the
+        #    agent's request track.  ["a2a", "request"] is distinct from the
+        #    agents' ["a2a"] namespace, preventing mis-routing.
+        await self._protocol.announce(["a2a", "request"])
+
+        # 3. Wait for relay's SUBSCRIBE → gives us the correct sub_id/alias
+        req_sub_id, req_alias = await self._protocol.wait_for_incoming_subscribe(
+            req_ns, req_track_name, timeout=5.0,
+        )
+        logger.info(
+            "MOQT client: relay subscribed to request track %s/%s (sub_id=%d)",
+            req_ns, req_track_name, req_sub_id,
         )
 
-        # 2. Announce that we will publish on the A2A namespace
-        await self._protocol.announce(["a2a"])
-
-        # 3. Publish request as OBJECT_STREAM (arbitrary sub/alias for publish direction)
+        # 4. Publish request on the relay-assigned subscription
         req_payload = request.model_dump_json().encode("utf-8")
         await self._protocol.publish_object(
-            subscribe_id=resp_sub_id,    # correlate with response subscription
-            track_alias=resp_alias + 1000,  # offset to distinguish publish alias
+            subscribe_id=req_sub_id,
+            track_alias=req_alias,
             payload=req_payload,
             priority=3,
         )
         logger.info("MOQT client: request published to agent=%s", self._agent_id)
 
-        # 4. Wait for response object
+        # 5. Await response
         obj = await self._protocol.receive_object(timeout=timeout)
         response_data = json.loads(obj.object_payload)
         return SendMessageResponse.model_validate(response_data)
+
+    async def unsubscribe(self, subscribe_id: int) -> None:
+        """Cancel a subscription (propagates through relay if connected via relay)."""
+        await self._protocol.unsubscribe(subscribe_id)
 
 
 # ---------------------------------------------------------------------------

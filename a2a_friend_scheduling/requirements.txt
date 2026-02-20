@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# A2A Friend Scheduling — Unified requirements
+#
+# Install all deps for the full monorepo:
+#   pip install -r requirements.txt
+#
+# For per-agent isolation (recommended), use the pyproject.toml in each
+# sub-directory with `uv sync` or `pip install -e .`.
+#
+# Python: >=3.10  (kaitlynn_agent_langgraph requires >=3.12)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── A2A SDK ───────────────────────────────────────────────────────────────────
+a2a-sdk>=0.2.5
+
+# ── MOQT Transport (QUIC + TLS) ───────────────────────────────────────────────
+aioquic>=1.2.0
+cryptography>=42.0.0
+
+# ── Google AI / ADK ───────────────────────────────────────────────────────────
+# Used by: karley_agent_adk, host_agent_adk
+google-adk>=1.2.1
+google-generativeai>=0.8.0
+
+# ── CrewAI ────────────────────────────────────────────────────────────────────
+# Used by: nate_agent_crewai
+crewai[tools]>=0.126.0
+
+# ── LangGraph / LangChain ─────────────────────────────────────────────────────
+# Used by: kaitlynn_agent_langgraph (requires Python >=3.12)
+langgraph>=0.3.18
+langchain-core>=0.3.22
+langchain-openai>=0.3.0        # Kaitlynn agent — Azure OpenAI backend
+
+# ── HTTP Client ───────────────────────────────────────────────────────────────
+httpx>=0.28.1
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+pydantic>=2.10.6
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0

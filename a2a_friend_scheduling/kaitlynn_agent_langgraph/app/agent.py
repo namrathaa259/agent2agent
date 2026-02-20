@@ -1,3 +1,4 @@
+import os
 import random
 from collections.abc import AsyncIterable
 from datetime import date, datetime, timedelta
@@ -6,7 +7,7 @@ from typing import Any, List, Literal
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import AzureChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
@@ -118,7 +119,12 @@ class KaitlynAgent:
     )
 
     def __init__(self):
-        self.model = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+        self.model = AzureChatOpenAI(
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            azure_deployment=os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o"),
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+            api_key=os.environ["AZURE_OPENAI_API_KEY"],
+        )
         self.tools = [get_availability]
 
         self.graph = create_react_agent(
