@@ -1,0 +1,58 @@
+# ── Environment & Secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.secret
+
+# ── TLS / QUIC Dev Certificates ───────────────────────────────────────────────
+# Generated at runtime by ensure_dev_certs(); never commit private keys.
+moqt_certs/key.pem
+moqt_certs/cert.pem
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+MANIFEST
+
+# ── Virtual Environments ──────────────────────────────────────────────────────
+myenv/
+
+# ── uv ────────────────────────────────────────────────────────────────────────
+# Lock files are intentionally committed per-subpackage (keeps deps reproducible).
+# Uncomment the line below only if you want to ignore them.
+# uv.lock
+
+# ── Testing & Coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+.hypothesis/
+
+# ── Type Checking ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs & Temp Files ─────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak

@@ -356,9 +356,146 @@ class SubscribeNamespaceOk:
 
 
 @dataclass
+class SubscribeError:
+    subscribe_id: int
+    error_code: int = 0
+    reason: str = ""
+    track_alias: int = 0
+
+    def encode(self) -> bytes:
+        payload = (
+            encode_varint(self.subscribe_id)
+            + encode_varint(self.error_code)
+            + encode_string(self.reason)
+            + encode_varint(self.track_alias)
+        )
+        return frame_message(MsgType.SUBSCRIBE_ERROR, payload)
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "SubscribeError":
+        offset = 0
+        sub_id, offset = decode_varint(payload, offset)
+        code, offset = decode_varint(payload, offset)
+        reason, offset = decode_string(payload, offset)
+        alias, offset = decode_varint(payload, offset)
+        return cls(subscribe_id=sub_id, error_code=code, reason=reason, track_alias=alias)
+
+
+@dataclass
+class Unsubscribe:
+    subscribe_id: int
+
+    def encode(self) -> bytes:
+        return frame_message(MsgType.UNSUBSCRIBE, encode_varint(self.subscribe_id))
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "Unsubscribe":
+        sub_id, _ = decode_varint(payload, 0)
+        return cls(subscribe_id=sub_id)
+
+
+class SubscribeDoneStatus(IntEnum):
+    UNSUBSCRIBED = 0x00
+    INTERNAL_ERROR = 0x01
+    UNAUTHORIZED = 0x02
+    TRACK_ENDED = 0x03
+    SUBSCRIPTION_ENDED = 0x04
+    GOING_AWAY = 0x05
+    EXPIRED = 0x06
+
+
+@dataclass
+class SubscribeDone:
+    subscribe_id: int
+    status_code: int = 0
+    reason: str = ""
+    content_exists: bool = False
+
+    def encode(self) -> bytes:
+        payload = (
+            encode_varint(self.subscribe_id)
+            + encode_varint(self.status_code)
+            + encode_string(self.reason)
+            + bytes([0x01 if self.content_exists else 0x00])
+        )
+        return frame_message(MsgType.SUBSCRIBE_DONE, payload)
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "SubscribeDone":
+        offset = 0
+        sub_id, offset = decode_varint(payload, offset)
+        code, offset = decode_varint(payload, offset)
+        reason, offset = decode_string(payload, offset)
+        content_exists = payload[offset] == 0x01 if offset < len(payload) else False
+        return cls(subscribe_id=sub_id, status_code=code, reason=reason, content_exists=content_exists)
+
+
+@dataclass
+class GoAway:
+    new_session_uri: str = ""
+
+    def encode(self) -> bytes:
+        return frame_message(MsgType.GOAWAY, encode_string(self.new_session_uri))
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "GoAway":
+        uri, _ = decode_string(payload, 0) if payload else ("", 0)
+        return cls(new_session_uri=uri)
+
+
+@dataclass
+class MaxSubscribeId:
+    max_subscribe_id: int
+
+    def encode(self) -> bytes:
+        return frame_message(MsgType.MAX_SUBSCRIBE_ID, encode_varint(self.max_subscribe_id))
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "MaxSubscribeId":
+        val, _ = decode_varint(payload, 0)
+        return cls(max_subscribe_id=val)
+
+
+@dataclass
+class Unannounce:
+    namespace: list[str]
+
+    def encode(self) -> bytes:
+        return frame_message(MsgType.UNANNOUNCE, encode_tuple(self.namespace))
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "Unannounce":
+        ns, _ = decode_tuple(payload, 0)
+        return cls(namespace=ns)
+
+
+@dataclass
+class SubscribeNamespaceError:
+    namespace_prefix: list[str]
+    error_code: int = 0
+    reason: str = ""
+
+    def encode(self) -> bytes:
+        payload = (
+            encode_tuple(self.namespace_prefix)
+            + encode_varint(self.error_code)
+            + encode_string(self.reason)
+        )
+        return frame_message(MsgType.SUBSCRIBE_NAMESPACE_ERROR, payload)
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "SubscribeNamespaceError":
+        offset = 0
+        ns, offset = decode_tuple(payload, offset)
+        code, offset = decode_varint(payload, offset)
+        reason, offset = decode_string(payload, offset)
+        return cls(namespace_prefix=ns, error_code=code, reason=reason)
+
+
+@dataclass
 class ObjectStream:
     """
-    OBJECT_STREAM (0x00) — sent on its own unidirectional QUIC stream.
+    OBJECT_STREAM (0x00) -- sent on its own unidirectional QUIC stream.
     Header fields come first (no length prefix); payload fills the rest of the stream.
     """
     subscribe_id: int
@@ -399,27 +536,49 @@ class ObjectStream:
 
 
 # ---------------------------------------------------------------------------
+# Full Track Name type alias
+# ---------------------------------------------------------------------------
+
+FullTrackName = tuple[tuple[str, ...], str]  # (namespace_tuple, track_name)
+
+
+def namespace_prefix_match(prefix: tuple[str, ...], namespace: tuple[str, ...]) -> bool:
+    """
+    MOQT Namespace Prefix Matching (draft-ietf-moq-transport Section 8.5):
+    Fields are matched sequentially; if the prefix has the same or fewer fields
+    than the namespace, and each field matches exactly, it qualifies.
+    """
+    if len(prefix) > len(namespace):
+        return False
+    return all(p == n for p, n in zip(prefix, namespace))
+
+
+# ---------------------------------------------------------------------------
 # A2A Track-namespace helpers  (draft-a2a-moqt-transport-00 §3.2)
 # ---------------------------------------------------------------------------
 
-def request_track(agent_id: str) -> tuple[list[str], str]:
-    """Track the HOST publishes requests on → agent reads."""
-    return (["a2a"], f"agent-{agent_id}/request")
+def request_track(agent_id: str, session_ctx: str = "") -> tuple[list[str], str]:
+    """Track the HOST publishes requests on -> agent reads."""
+    ns = [session_ctx, "a2a"] if session_ctx else ["a2a"]
+    return (ns, f"agent-{agent_id}/request")
 
 
-def response_track(agent_id: str) -> tuple[list[str], str]:
-    """Track the AGENT publishes responses on → host reads."""
-    return (["a2a"], f"agent-{agent_id}/response")
+def response_track(agent_id: str, session_ctx: str = "") -> tuple[list[str], str]:
+    """Track the AGENT publishes responses on -> host reads."""
+    ns = [session_ctx, "a2a"] if session_ctx else ["a2a"]
+    return (ns, f"agent-{agent_id}/response")
 
 
-def discovery_track(agent_id: str) -> tuple[list[str], str]:
+def discovery_track(agent_id: str, session_ctx: str = "") -> tuple[list[str], str]:
     """Track the AGENT publishes its AgentCard on."""
-    return (["a2a", "discovery"], f"agent-{agent_id}")
+    ns = [session_ctx, "a2a", "discovery"] if session_ctx else ["a2a", "discovery"]
+    return (ns, f"agent-{agent_id}")
 
 
-def stream_track(agent_id: str, task_id: str) -> tuple[list[str], str]:
+def stream_track(agent_id: str, task_id: str, session_ctx: str = "") -> tuple[list[str], str]:
     """Track for streaming task updates."""
-    return (["a2a"], f"agent-{agent_id}/task_{task_id}")
+    ns = [session_ctx, "a2a"] if session_ctx else ["a2a"]
+    return (ns, f"agent-{agent_id}/task_{task_id}")
 
 
 
