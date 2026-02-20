@@ -30,16 +30,13 @@ crewai[tools]>=0.126.0
 # Used by: kaitlynn_agent_langgraph (requires Python >=3.12)
 langgraph>=0.3.18
 langchain-core>=0.3.22
-langchain-google-genai>=2.0.10
+langchain-openai>=0.3.0        # Kaitlynn agent — Azure OpenAI backend
 
 # ── HTTP Client ───────────────────────────────────────────────────────────────
 httpx>=0.28.1
 
 # ── Data Validation ───────────────────────────────────────────────────────────
 pydantic>=2.10.6
-
-# ── Async Utilities ───────────────────────────────────────────────────────────
-nest-asyncio>=1.6.0
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0

@@ -379,6 +379,11 @@ class MOQTRelaySession(QuicConnectionProtocol):
         # Per-subscription object-id counter for forwarded objects
         self._obj_counters: dict[int, int] = {}
 
+        # Per unidirectional-stream reassembly buffers.
+        # QUIC can fragment a single stream across multiple StreamDataReceived
+        # events; we must accumulate the full object before parsing.
+        self._data_bufs: dict[int, bytes] = {}
+
     @property
     def session_id(self) -> str:
         return self._session_id
@@ -394,9 +399,17 @@ class MOQTRelaySession(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             sid = event.stream_id
             if sid % 4 == 0:
+                # Bidirectional stream 0 = MOQT control stream (already buffered
+                # inside _on_control_data).
                 self._on_control_data(sid, event.data)
             elif sid % 4 == 2:
-                self._on_client_data(event.data)
+                # Client-initiated unidirectional stream = one OBJECT_STREAM.
+                # QUIC may deliver the bytes in multiple fragments, so we
+                # accumulate until end_stream before parsing.
+                self._data_bufs[sid] = self._data_bufs.get(sid, b"") + event.data
+                if event.end_stream:
+                    buf = self._data_bufs.pop(sid)
+                    self._on_client_data(buf)
 
         elif isinstance(event, ConnectionTerminated):
             logger.info("Relay session %s: connection terminated", self._session_id)

@@ -96,6 +96,9 @@ class MOQTAgentSession(QuicConnectionProtocol):
         # Per-subscription object-id counter
         self._obj_counters: dict[int, int] = {}
 
+        # Per unidirectional-stream reassembly buffers (same fragmentation fix as relay).
+        self._data_bufs: dict[int, bytes] = {}
+
     # ------------------------------------------------------------------
     # aioquic event dispatch
     # ------------------------------------------------------------------
@@ -112,7 +115,10 @@ class MOQTAgentSession(QuicConnectionProtocol):
             if sid % 4 == 0:
                 self._on_control_data(sid, event.data)
             elif sid % 4 == 2:
-                asyncio.ensure_future(self._on_request_stream(event.data))
+                self._data_bufs[sid] = self._data_bufs.get(sid, b"") + event.data
+                if event.end_stream:
+                    buf = self._data_bufs.pop(sid)
+                    asyncio.ensure_future(self._on_request_stream(buf))
 
         elif isinstance(event, ConnectionTerminated):
             logger.info("MOQT server: connection terminated")
@@ -329,6 +335,9 @@ class MOQTRelayAgentProtocol(QuicConnectionProtocol):
         self._request_sub_id: int = 0
         self._request_alias: int = 0
 
+        # Per unidirectional-stream reassembly buffers.
+        self._data_bufs: dict[int, bytes] = {}
+
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, HandshakeCompleted):
             asyncio.ensure_future(self._send_client_setup())
@@ -338,7 +347,10 @@ class MOQTRelayAgentProtocol(QuicConnectionProtocol):
             if sid % 4 == 0:
                 self._on_control_data(sid, event.data)
             elif sid % 4 == 3:
-                asyncio.ensure_future(self._on_relay_data(event.data))
+                self._data_bufs[sid] = self._data_bufs.get(sid, b"") + event.data
+                if event.end_stream:
+                    buf = self._data_bufs.pop(sid)
+                    asyncio.ensure_future(self._on_relay_data(buf))
 
         elif isinstance(event, ConnectionTerminated):
             logger.info("MOQT relay-agent: connection terminated")

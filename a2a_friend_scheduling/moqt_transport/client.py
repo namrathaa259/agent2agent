@@ -93,6 +93,9 @@ class MOQTClientProtocol(QuicConnectionProtocol):
         # Incoming OBJECT_STREAMs from the server
         self._incoming: asyncio.Queue[ObjectStream] = asyncio.Queue()
 
+        # Per unidirectional-stream reassembly buffers (same fragmentation fix as relay).
+        self._data_bufs: dict[int, bytes] = {}
+
         self._next_sub_id: int = 0
         self._next_alias: int = 0
 
@@ -112,7 +115,10 @@ class MOQTClientProtocol(QuicConnectionProtocol):
             if sid % 4 == 0:
                 self._on_control_data(sid, event.data)
             elif sid % 4 == 3:
-                self._on_server_data(event.data)
+                self._data_bufs[sid] = self._data_bufs.get(sid, b"") + event.data
+                if event.end_stream:
+                    buf = self._data_bufs.pop(sid)
+                    self._on_server_data(buf)
 
     # ------------------------------------------------------------------
     # Control stream

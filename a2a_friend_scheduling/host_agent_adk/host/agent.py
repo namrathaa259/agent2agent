@@ -6,12 +6,15 @@ import uuid
 from datetime import datetime
 from typing import Any, AsyncIterable, List
 
-import nest_asyncio
-
 # MOQT transport — replaces A2ACardResolver + httpx
 # __file__ = host_agent_adk/host/agent.py  →  "../.." = a2a_friend_scheduling/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from moqt_transport import MOQTCardResolver
+from moqt_transport import MOQTAgentClient, MOQTCardResolver
+
+# Set MOQT_RELAY_URL=moqt://localhost:20000 in .env to enable relay mode.
+# In relay mode the host discovers all friend agents automatically via
+# SUBSCRIBE_NAMESPACE; no hardcoded per-agent ports are needed.
+_RELAY_URL = os.getenv("MOQT_RELAY_URL")
 
 from a2a.types import (
     AgentCard,
@@ -24,6 +27,7 @@ from a2a.types import (
 from dotenv import load_dotenv
 from google.adk import Agent
 from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.models.lite_llm import LiteLlm
 from google.adk.artifacts import InMemoryArtifactService
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.runners import Runner
@@ -38,7 +42,28 @@ from .pickleball_tools import (
 from .remote_agent_connection import RemoteAgentConnections
 
 load_dotenv()
-nest_asyncio.apply()
+
+
+def _build_llm():
+    """
+    Return the LLM for the Host Agent.
+
+    Priority:
+      1. Azure OpenAI  — when AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set
+      2. Gemini        — fallback (requires GOOGLE_API_KEY)
+    """
+    azure_key = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    if azure_key and azure_endpoint:
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+        return LiteLlm(
+            model=f"azure/{deployment}",
+            api_key=azure_key,
+            api_base=azure_endpoint,
+            api_version=api_version,
+        )
+    return "gemini-2.5-flash"
 
 
 # ---------------------------------------------------------------------------
@@ -67,12 +92,15 @@ def _agent_id_from_url(url: str) -> str:
 class HostAgent:
     """The Host agent."""
 
-    def __init__(
-        self,
-    ):
+    def __init__(self):
         self.remote_agent_connections: dict[str, RemoteAgentConnections] = {}
         self.cards: dict[str, AgentCard] = {}
         self.agents: str = ""
+        # _connections_ready: True once agents have been discovered.
+        # _connecting: True while a discovery coroutine is in-flight (prevents
+        #              duplicate concurrent discoveries).
+        self._connections_ready = False
+        self._connecting = False
         self._agent = self.create_agent()
         self._user_id = "host_agent"
         self._runner = Runner(
@@ -82,6 +110,36 @@ class HostAgent:
             session_service=InMemorySessionService(),
             memory_service=InMemoryMemoryService(),
         )
+
+    async def _ensure_connections(self) -> None:
+        """
+        Open MOQT connections / run relay discovery.
+
+        Safe to call concurrently: the _connecting flag prevents duplicate
+        in-flight discoveries.  Sets _connections_ready when agents are found.
+        """
+        if self._connections_ready:
+            return
+        if self._connecting:
+            # Another coroutine is already discovering — wait a moment then return.
+            await asyncio.sleep(0.5)
+            return
+        self._connecting = True
+        try:
+            if _RELAY_URL:
+                await self._async_init_via_relay(_RELAY_URL)
+            else:
+                await self._async_init_components([
+                    "moqt://localhost:20002",  # Karley Agent
+                    "moqt://localhost:20003",  # Nate Agent
+                    "moqt://localhost:20004",  # Kaitlynn Agent
+                ])
+            self._connections_ready = True
+        except Exception as exc:
+            print(f"WARNING: Could not connect to friend agents: {exc}")
+            self.agents = "No friends available right now — are the agents running?"
+        finally:
+            self._connecting = False
 
     async def _async_init_components(self, remote_agent_addresses: List[str]):
         _ca_cert_path = os.path.join(
@@ -121,9 +179,58 @@ class HostAgent:
         await instance._async_init_components(remote_agent_addresses)
         return instance
 
+    @classmethod
+    async def create_via_relay(cls, relay_url: str):
+        """
+        Relay mode: discover all friend agents automatically via
+        SUBSCRIBE_NAMESPACE, then wire up RemoteAgentConnections pointing
+        at the relay so that every send_message is routed through it.
+        """
+        instance = cls()
+        await instance._async_init_via_relay(relay_url)
+        return instance
+
+    async def _async_init_via_relay(self, relay_url: str):
+        ca_cert_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "moqt_certs", "cert.pem"
+        )
+        ca_cert = ca_cert_path if os.path.exists(ca_cert_path) else None
+
+        relay_host, relay_port = _parse_moqt_url(relay_url)
+        print(f"Host Agent: discovering friends via relay {relay_host}:{relay_port} …")
+
+        discovery_client = MOQTAgentClient(
+            relay_host, relay_port, "host-discovery", ca_cert=ca_cert
+        )
+        await discovery_client.connect()
+        try:
+            cards = await discovery_client.discover_agents(timeout=6.0, max_agents=10)
+        finally:
+            await discovery_client.close()
+
+        if not cards:
+            print("WARNING: No agents discovered via relay. Is the relay running?")
+
+        for card in cards:
+            # All outbound messages are routed through the relay; the
+            # agent_id (derived from card.name) tells the relay who to
+            # deliver to.
+            remote_connection = RemoteAgentConnections(
+                agent_card=card, agent_url=relay_url
+            )
+            self.remote_agent_connections[card.name] = remote_connection
+            self.cards[card.name] = card
+
+        agent_info = [
+            json.dumps({"name": card.name, "description": card.description})
+            for card in self.cards.values()
+        ]
+        print("agent_info:", agent_info)
+        self.agents = "\n".join(agent_info) if agent_info else "No friends found"
+
     def create_agent(self) -> Agent:
         return Agent(
-            model="gemini-2.5-flash",
+            model=_build_llm(),
             name="Host_Agent",
             instruction=self.root_instruction,
             description="This Host agent orchestrates scheduling pickleball with friends.",
@@ -135,6 +242,27 @@ class HostAgent:
         )
 
     def root_instruction(self, context: ReadonlyContext) -> str:
+        # Kick off MOQT discovery the first time the instruction is rendered
+        # (i.e., on the very first user message).  The event loop is running
+        # at this point because we are inside an ADK/uvicorn request handler.
+        if not self._connections_ready and not self._connecting:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._ensure_connections())
+            except Exception:
+                pass
+
+        if self._connections_ready and self.agents:
+            agents_section = self.agents
+        elif self._connecting:
+            agents_section = (
+                "⏳ Discovering friend agents via the relay — this takes a few seconds. "
+                "Please reply with your request again and I will be ready."
+            )
+        else:
+            agents_section = "No friend agents are currently connected."
+
         return f"""
         **Role:** You are the Host Agent, an expert scheduler for pickleball games. Your primary function is to coordinate with friend agents to find a suitable time to play and then book a court.
 
@@ -153,12 +281,12 @@ class HostAgent:
         *   **Readability:** Make sure to respond in a concise and easy to read format (bullet points are good).
         *   Each available agent represents a friend. So Bob_Agent represents Bob.
         *   When asked for which friends are available, you should return the names of the available friends (aka the agents that are active).
-        *   When get
+        *   If agent discovery is still in progress, tell the user politely and ask them to repeat their request in a moment.
 
         **Today's Date (YYYY-MM-DD):** {datetime.now().strftime("%Y-%m-%d")}
 
         <Available Agents>
-        {self.agents}
+        {agents_section}
         </Available Agents>
         """
 
@@ -168,6 +296,7 @@ class HostAgent:
         """
         Streams the agent's response to a given query.
         """
+        await self._ensure_connections()
         session = await self._runner.session_service.get_session(
             app_name=self._agent.name,
             user_id=self._user_id,
@@ -206,6 +335,7 @@ class HostAgent:
 
     async def send_message(self, agent_name: str, task: str, tool_context: ToolContext):
         """Sends a task to a remote friend agent."""
+        await self._ensure_connections()
         if agent_name not in self.remote_agent_connections:
             raise ValueError(f"Agent {agent_name} not found")
         client = self.remote_agent_connections[agent_name]
@@ -252,35 +382,15 @@ class HostAgent:
         return resp
 
 
-def _get_initialized_host_agent_sync():
-    """Synchronously creates and initializes the HostAgent."""
-
-    async def _async_main():
-        # MOQT (QUIC) URLs for the friend agents
-        friend_agent_urls = [
-            "moqt://localhost:20002",  # Karley's Agent
-            "moqt://localhost:20003",  # Nate's Agent
-            "moqt://localhost:20004",  # Kaitlynn's Agent
-        ]
-
-        print("initializing host agent")
-        hosting_agent_instance = await HostAgent.create(
-            remote_agent_addresses=friend_agent_urls
-        )
-        print("HostAgent initialized")
-        return hosting_agent_instance.create_agent()
-
-    try:
-        return asyncio.run(_async_main())
-    except RuntimeError as e:
-        if "asyncio.run() cannot be called from a running event loop" in str(e):
-            print(
-                f"Warning: Could not initialize HostAgent with asyncio.run(): {e}. "
-                "This can happen if an event loop is already running (e.g., in Jupyter). "
-                "Consider initializing HostAgent within an async function in your application."
-            )
-        else:
-            raise
-
-
-root_agent = _get_initialized_host_agent_sync()
+# ---------------------------------------------------------------------------
+# Module-level root_agent required by `adk web`.
+#
+# We create the HostAgent synchronously with zero network I/O so that the
+# module always imports cleanly — even when no friend agents or relay are
+# running yet.  The actual MOQT connections are established lazily on the
+# first call to stream() or send_message() via _ensure_connections().
+# ---------------------------------------------------------------------------
+print("Initialising HostAgent (lazy MOQT connections)…")
+_host_instance = HostAgent()
+root_agent = _host_instance.create_agent()
+print("HostAgent ready — friend-agent connections will be established on first request.")
